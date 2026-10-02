@@ -1,0 +1,20 @@
+{
+  "archives": {
+    "evidence": [],
+    "harbor_task": []
+  },
+  "files": {
+    "pilot": "",
+    "codex": "",
+    "seed": "",
+    "checklist": ""
+  },
+  "qa_report": {
+    "path": "",
+    "sha256": ""
+  },
+  "archive_item_schema": {
+    "source": "",
+    "target": ""
+  }
+}

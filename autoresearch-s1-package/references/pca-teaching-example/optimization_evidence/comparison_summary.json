@@ -1,0 +1,30 @@
+{
+  "schema_version": "autoresearch-comparison-summary.v2",
+  "status": "NOT_RUN",
+  "metric": {
+    "name": "native_reward",
+    "direction": "maximize"
+  },
+  "seeds": [],
+  "paired_results": {},
+  "statistics": {
+    "paired_run_count": 0,
+    "baseline_mean": null,
+    "baseline_sample_std": null,
+    "reference_mean": null,
+    "reference_sample_std": null,
+    "mean_paired_improvement": null,
+    "relative_improvement": null,
+    "baseline_sigma_multiple": null
+  },
+  "significance_rule": {
+    "required_baseline_sigma_multiple": 3.0,
+    "passed": null
+  },
+  "validity": {
+    "same_protocol": null,
+    "same_seed_set": null,
+    "all_quality_gates_passed": null,
+    "all_checkpoints_reload_and_rescore_passed": null
+  }
+}

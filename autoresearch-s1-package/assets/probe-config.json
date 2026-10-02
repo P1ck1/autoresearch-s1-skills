@@ -1,0 +1,20 @@
+{
+  "mode": "production",
+  "timeout_seconds": 120,
+  "tracks": {
+    "codex": {
+      "model": "GPT-5.6 Sol",
+      "effort": "Max",
+      "adapter_argv": [],
+      "candidate_root": "",
+      "adapter_files": []
+    },
+    "seed": {
+      "model": "Seed 2.1 Turbo",
+      "effort": "High",
+      "adapter_argv": [],
+      "candidate_root": "",
+      "adapter_files": []
+    }
+  }
+}

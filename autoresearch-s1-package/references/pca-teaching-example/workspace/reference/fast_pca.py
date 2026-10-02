@@ -1,0 +1,1051 @@
+"""Fast reference PCA -- a self-contained, systems-optimized implementation.
+
+This is the reference the benchmark uses for its achievable-speed anchor. It computes the same
+Patterson object as the full scan while adapting both file access and linear-algebra orientation:
+
+  * estimate informative-marker density with byte-unbiased strata;
+  * on a large body, spread nonoverlapping sampled cores across the file so local LD does not
+    dominate; when the marker target or setup cost requires complete coverage, deliberately stream
+    the whole body in long sequential cores instead;
+  * issue core reads from a thread pool via ``os.pread`` and decode/Patterson-standardise them in
+    NumPy;
+  * when sample space is smaller, pipeline panels into one sample Gram with BLAS ``ssyrk`` and use
+    an exact top-k eigensolve; when marker space is smaller, retain the standardized design and use
+    a matrix-free eigensolve on the smaller side.
+
+On a multi-GB, marker-heavy VCF, the sampled path can recover the structured full-scan subspace
+while reading a fraction of the body. Complete reads on small or sparse inputs are an intentional
+part of the strategy, not a fallback.
+
+Usage:  python -m reference.fast_pca <vcf> <k> <out.tsv> [--blocks N] [--block-size BYTES]
+"""
+
+from __future__ import annotations
+
+# Size BLAS to the physical-core count BEFORE numpy is imported. The Gram is accumulated by ONE
+# multi-threaded SYRK (the compute-team pipeline), so a wide BLAS is exactly the parallelism we
+# want -- not the old per-worker model where K threads each ran a single-threaded GEMM. The thread
+# count is read once at BLAS init, so it must be set before numpy/scipy import. Set it on every
+# backend's knob so the widening is portable (OpenBLAS / MKL / Accelerate / BLIS) with NO runtime
+# ctypes (an ``import ctypes`` would trip the grader's pure-Python library_scan gate). setdefault,
+# not assignment: only ONE thread ever issues a BLAS call at a time in the compute path, so an
+# explicit caller/container pin can safely win without risking oversubscription.
+import os
+_phys = max(1, (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                else (os.cpu_count() or 4)) // 2)     # 2 SMT threads / physical core
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, str(_phys))
+# The pipeline's idle BLAS worker threads must yield PROMPTLY between panel SYRKs or they busy-spin
+# on the few physical cores and starve the GIL/pread-bound parser threads (measured: an unset spin
+# timeout can turn a ~3 s kernel into >10 s). Read once at OpenBLAS init, so export before import.
+os.environ.setdefault("OPENBLAS_THREAD_TIMEOUT", "1")
+
+import argparse
+import queue
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+from scipy.linalg import eigh as subset_eigh
+from scipy.linalg.blas import ssyrk
+
+POSIX_FADV_RANDOM = getattr(os, "POSIX_FADV_RANDOM", 1)
+POSIX_FADV_SEQUENTIAL = getattr(os, "POSIX_FADV_SEQUENTIAL", 2)
+DEFAULT_BLOCKS = 4096
+DEFAULT_BLOCK_SIZE = 262144
+DEFAULT_TARGET_VARIANTS = 200_000
+MIN_SAMPLING_STRATA = 256
+# A full sequential stream wants I/O-sized runs, not sampling strata. 16 MiB amortizes the parse
+# call over enough records that per-call overhead stops showing up in the wall clock.
+SEQUENTIAL_CORE_BYTES = 16 << 20
+# A parser/compute-team pipeline is the right tool for a multi-gigabyte stream and the wrong one for
+# a small file: spinning up parser lanes, queues and a compute team costs a fixed sum that a small
+# body can never repay. Measured on an idle 8-core box, paying it on a ~20 MB VCF made this fit 1.4x
+# SLOWER than a plain sequential full scan -- the sampler beaten by the very thing it exists to
+# beat. Below the break-even, take the single-lane path instead: just read the file.
+PIPELINE_MIN_BODY_BYTES = 64 << 20
+# The body-size gate above is necessary but not sufficient: a *large* body from which the budget reads
+# only a small sampled fraction has the same economics as a small file -- there are few bytes to move,
+# so the pipeline's fixed standing-up cost cannot be repaid, and paying it is a dead loss. The gate
+# that actually decides throughput is therefore keyed on the bytes we will *read*, not the body we
+# could read. This matters most under the measurement sandbox: bwrap adds a fixed tax to spinning up
+# the thread pool, wide-BLAS init and the concurrent-pread team that a single lane never pays, and the
+# grader's shared no-op overhead baseline -- which never exercises the parallel path -- cannot subtract
+# it. On a small read that tax lands uncorrected and can push even this reference behind a plain full
+# scan. Below this many bytes-read, take the single lane regardless of body size. Calibrated against
+# the real sandbox so the reference ties-or-beats a full scan on every fold (see
+# rollout_analysis/from_scratch_pca/gold_below_full_scan_diagnosis_2026-07-19.md).
+PIPELINE_MIN_READ_BYTES = 384 << 20
+
+_ZERO = ord("0")
+_ONE = ord("1")
+_TAB = ord("\t")
+_COLON = ord(":")
+_SLASH = ord("/")
+_PIPE = ord("|")
+
+
+# --------------------------------------------------------------------------- Patterson math
+def is_clean_biallelic_snv(ref: bytes, alt: bytes) -> bool:
+    return len(ref) == 1 and len(alt) == 1 and ref in b"ACGTacgt" and alt in b"ACGTacgt"
+
+
+def _standardize_kept(dose_block: np.ndarray):
+    """Patterson-standardise a (n_variants x n_samples) int8 dosage block (missing=-1) and
+    return the kept standardised rows Z (float32) -- or None. Copy-minimal: allele frequencies
+    and observed variance are computed exactly from the raw integers, and only KEPT variants are
+    converted to float. Rows are oriented to the minor allele before float32 conversion, avoiding
+    cancellation near fixation while retaining a fast float32 SYRK (ssyrk, symmetric rank-k
+    update -- half a GEMM's FLOPs) for the dominant Gram accumulation."""
+    n = dose_block.shape[1]
+    if n > 1 and dose_block.min() >= 0:
+        # NO-MISSING fast branch (the common case: chr22 and the synthetic panels carry no '.'
+        # call). Every call is present, so n_missing == 0 and the (m x n) boolean missing mask,
+        # its per-row sum, and the masked mean-impute scatter are all provable no-ops -- skip
+        # allocating and scanning them. The retained arithmetic is BYTE-for-BYTE the masked path
+        # with n_missing == 0 substituted (n_valid == n, imputes nothing), including the exact
+        # minor-allele orientation, so the standardised rows are bit-identical.
+        isum = dose_block.sum(axis=1, dtype=np.int64)
+        isumsq = np.square(dose_block).sum(axis=1, dtype=np.int64)
+        minor_count = np.minimum(isum, 2 * n - isum)
+        informative = n * isumsq > isum * isum
+        keep = (minor_count > 0) & informative          # n_valid == n > 1 already guaranteed
+        if not keep.any():
+            return None
+        Z = dose_block[keep].astype(np.float32)         # convert only the kept variants
+        flip = isum[keep] > n
+        Z[flip] = 2.0 - Z[flip]                         # orient every row to the minor allele
+        p = minor_count[keep].astype(np.float64) / (2.0 * n)
+        center = (2.0 * p).astype(np.float32)[:, None]
+        scale = np.sqrt(2.0 * p * (1.0 - p)).astype(np.float32)[:, None]
+        Z -= center                                     # centre; nothing to impute
+        Z /= scale
+        return Z
+    missing = dose_block < 0
+    n_missing = missing.sum(axis=1)
+    n_valid = dose_block.shape[1] - n_missing
+    # Missing is encoded as -1: add it back out of the integer sum and squared sum.
+    isum = dose_block.sum(axis=1, dtype=np.int64) + n_missing
+    isumsq = np.square(dose_block).sum(axis=1, dtype=np.int64) - n_missing
+    total_alleles = 2 * n_valid
+    minor_count = np.minimum(isum, total_alleles - isum)
+    # Exact positive observed variance. This rejects all-heterozygous rows, which have a nonzero
+    # allele frequency but contribute an all-zero standardized row.
+    informative = n_valid * isumsq > isum * isum
+    keep = (n_valid > 1) & (minor_count > 0) & informative
+    if not keep.any():
+        return None
+    Z = dose_block[keep].astype(np.float32)           # convert only the kept variants
+    flip = isum[keep] > n_valid[keep]
+    Z[flip] = 2.0 - Z[flip]                           # orient every row to the minor allele
+    p = minor_count[keep].astype(np.float64) / (2.0 * n_valid[keep])
+    center = (2.0 * p).astype(np.float32)[:, None]
+    scale = np.sqrt(2.0 * p * (1.0 - p)).astype(np.float32)[:, None]
+    Z -= center
+    Z[missing[keep]] = 0.0                            # mean imputation after centring
+    Z /= scale
+    return Z
+
+
+def standardize_into_gram(dose_block: np.ndarray, gram: np.ndarray, counter: dict) -> None:
+    """Standardise a dosage block and accumulate Z^T Z into the LOWER triangle of ``gram`` in
+    place via a symmetric rank-k update (streaming Gram).
+
+    The Gram is symmetric, so a full GEMM (``Z.T @ Z``) computes both halves and writes an n x n
+    temporary. ssyrk updates ONE triangle in place at ~half the FLOPs with no temporary. ``gram``
+    must be Fortran-ordered float32 so scipy hands ``c`` straight to BLAS with no copy; ``Z`` is
+    C-contiguous, so ``Z.T`` is already Fortran-ordered and ssyrk(trans=0) computes
+    ``Z.T @ (Z.T)^T = Z^T Z`` with no transpose/copy of the (potentially large) ``Z`` either. Only
+    the lower triangle is written (the triangle LAPACK's eigh reads by default); the other stays at
+    its initial zero, so summing per-worker partials is still exact -- each partial is one triangle,
+    so the sum is one triangle."""
+    Z = _standardize_kept(dose_block)
+    if Z is None:
+        return
+    # C_lower += 1.0 * (Z.T) @ (Z.T)^T = Z^T Z, accumulated in place (beta=1, overwrite_c=1).
+    ssyrk(1.0, Z.T, beta=1.0, c=gram, trans=0, lower=1, overwrite_c=1)
+    counter["kept"] += Z.shape[0]
+
+
+def standardize_block(dose_block: np.ndarray) -> np.ndarray | None:
+    """Return the standardised float32 rows Z (missing imputed to the mean => 0 after centring).
+    Unlike ``standardize_into_gram`` this never forms the n x n Gram -- the matrix-free path
+    keeps Z and applies it implicitly. Same copy-minimal path as the Gram engine."""
+    return _standardize_kept(dose_block)
+
+
+def matrixfree_scores(Z: np.ndarray, k: int, seed: int = 0):
+    """Accurate top-k scores without forming the larger covariance matrix.
+
+    Lanczos runs on whichever side of Z is smaller. In the intended M < n regime this is the
+    M-by-M variant covariance, applied implicitly as Z @ (Z.T @ x), after which the sample scores
+    are recovered as Z.T @ U / sqrt(M). ARPACK stops from a Ritz-residual tolerance rather than a
+    fixed number of power iterations; an explicit residual check prevents unconverged PCs from
+    being written. The matvecs stay float32 so they use fast SGEMV, while Lanczos orthogonalisation
+    and Ritz values stay float64."""
+    Z = np.asarray(Z, dtype=np.float32, order="C")
+    if Z.ndim != 2:
+        raise ValueError("standardized design must be a matrix")
+    M, n = Z.shape
+    if M < 1 or n < 2:
+        raise ValueError("PCA requires at least one variant and two samples")
+    k = int(k)
+    if k < 1 or k >= n:
+        raise ValueError("k must satisfy 1 <= k < number of samples")
+    if k > M:
+        raise ValueError(f"only {M} informative variants available for {k} PCs")
+
+    scale = float(M)
+    left_side = M <= n
+    dim = M if left_side else n
+
+    if left_side:
+        def apply(X):
+            X32 = np.asarray(X, dtype=np.float32)
+            return np.asarray(Z @ (Z.T @ X32), dtype=np.float64) / scale
+    else:
+        def apply(X):
+            X32 = np.asarray(X, dtype=np.float32)
+            return np.asarray(Z.T @ (Z @ X32), dtype=np.float64) / scale
+
+    if k == dim:
+        covariance = np.asarray(Z @ Z.T, dtype=np.float64) / scale
+        covariance = 0.5 * (covariance + covariance.T)
+        evals, vectors = np.linalg.eigh(covariance)
+        evals = evals[::-1]
+        vectors = vectors[:, ::-1]
+    else:
+        # Imported here, not at module scope. scipy.sparse.linalg costs ~0.46 s to import -- more
+        # than the entire fit on a small VCF -- and it is needed ONLY by this matrix-free branch,
+        # which exists for the biobank regime (n_samples > n_variants). Paying it on every run made
+        # the fast path measurably SLOWER than a plain full scan on small inputs: the sampler losing
+        # to the thing it exists to beat, purely on an import it never used.
+        from scipy.sparse.linalg import LinearOperator, eigsh
+
+        operator = LinearOperator(
+            shape=(dim, dim), dtype=np.float64, matvec=apply, matmat=apply,
+        )
+        rng = np.random.default_rng(seed)
+        evals, vectors = eigsh(
+            operator, k=k, which="LA", tol=1e-6,
+            ncv=min(dim, max(2 * k + 1, k + 24)),
+            v0=rng.standard_normal(dim), maxiter=max(300, 10 * dim),
+        )
+        order = np.argsort(evals)[::-1]
+        evals = evals[order]
+        vectors = vectors[:, order]
+
+    if not np.isfinite(evals).all():
+        raise RuntimeError("matrix-free eigensolver returned non-finite eigenvalues")
+    leading_scale = abs(float(evals[0]))
+    rank_floor = leading_scale * (32.0 * np.finfo(np.float32).eps)
+    if float(evals[-1]) <= rank_floor:
+        raise ValueError(f"standardized design has rank below requested {k} PCs")
+
+    residual = apply(vectors) - vectors * evals[None, :]
+    residual_scale = np.maximum(np.abs(evals), max(abs(float(evals[0])) * 1e-8, 1e-12))
+    relative_residual = np.linalg.norm(residual, axis=0) / residual_scale
+    worst_residual = float(relative_residual.max())
+    if not np.isfinite(worst_residual) or worst_residual > 5e-5:
+        raise RuntimeError(f"matrix-free eigensolver did not converge: residual={worst_residual:.3g}")
+
+    evals = np.clip(evals, 0.0, None)
+    if left_side:
+        scores = np.asarray(Z.T @ vectors.astype(np.float32), dtype=np.float64) / np.sqrt(scale)
+    else:
+        scores = vectors * np.sqrt(evals)[None, :]
+    for c in range(scores.shape[1]):
+        col = scores[:, c]
+        if col[np.argmax(np.abs(col))] < 0:
+            scores[:, c] = -col
+    return scores, evals
+
+
+def gram_to_scores(gram: np.ndarray, n_kept: int, k: int):
+    """Top-k PC scores from the accumulated Gram, computed EXACTLY via LAPACK's range
+    eigensolver (dsyevr through scipy's ``subset_by_index``).
+
+    A genotype Gram's spectrum has a few large continental eigenvalues sitting on a long,
+    slowly-decaying tail: past the leading axes the gaps shrink to ~0.03. A randomized
+    range-finder (sketch + a couple of power iterations) needs an eigengap to separate
+    eigenvectors, so on this spectrum it silently collapses the higher *structured* PCs --
+    measured on real 1000G chr22 it drops PC6+ to |corr|<0.5 with the exact subspace even
+    when handed ALL the markers. That is an accuracy bug, not a speed win: at realistic
+    sample counts (n up to a few thousand) the exact top-k solve is only ~0.4 s, because
+    dsyevr computes just the requested k eigenpairs rather than the full O(n^3) tridiagonal.
+    The matrix-free SVD engine still handles the biobank regime (n > n_variants) upstream,
+    so this path is only ever reached with a modest n where exactness is essentially free."""
+    if gram.ndim != 2 or gram.shape[0] != gram.shape[1]:
+        raise ValueError("Gram matrix must be square")
+    n = gram.shape[0]
+    k = int(k)
+    if n < 2 or k < 1 or k >= n:
+        raise ValueError("k must satisfy 1 <= k < number of samples")
+    if n_kept < 1:
+        raise ValueError("PCA requires at least one informative variant")
+    input_eps = np.finfo(gram.dtype).eps if np.issubdtype(gram.dtype, np.floating) \
+        else np.finfo(np.float64).eps
+    # The accumulator holds only ONE authoritative triangle (ssyrk writes the lower triangle; the
+    # upper stays zero). Solve the tiny top-k in float64 for stability, consuming the lower triangle
+    # directly (eigh reads it when lower=True) -- no 0.5*(G+G.T) symmetrisation needed.
+    G = gram.astype(np.float64)                        # eigensolve in float64 for stability
+    G /= n_kept
+    evals, evecs = subset_eigh(
+        G, subset_by_index=(n - k, n - 1), driver="evr", lower=True, check_finite=False,
+        overwrite_a=True,
+    )                                                   # exact top-k through LAPACK dsyevr
+    evals = evals[::-1]
+    evecs = evecs[:, ::-1]
+    leading_scale = abs(float(evals[0]))
+    rank_floor = leading_scale * (32.0 * input_eps)
+    if float(evals[-1]) <= rank_floor:
+        raise ValueError(f"standardized design has rank below requested {k} PCs")
+    evals = np.clip(evals, 0.0, None)
+    scores = evecs * np.sqrt(evals)[None, :]
+    for c in range(scores.shape[1]):
+        col = scores[:, c]
+        if col[np.argmax(np.abs(col))] < 0:
+            scores[:, c] = -col
+    return scores, evals
+
+
+# --------------------------------------------------------------------------- I/O + fit
+def _read_header(fd: int):
+    buf = b""
+    off = 0
+    while True:
+        chunk = os.pread(fd, 1 << 20, off)
+        if not chunk:
+            raise ValueError("EOF before #CHROM header")
+        buf += chunk
+        off += len(chunk)
+        # Match #CHROM only at the START of a line (a metadata ## line could mention "#CHROM" in
+        # a description). idx 0 or preceded by a newline.
+        idx = 0 if buf.startswith(b"#CHROM") else buf.find(b"\n#CHROM")
+        if idx != -1:
+            start = idx if idx == 0 else idx + 1
+            nl = buf.find(b"\n", start)
+            if nl != -1:
+                sample_ids = [s.decode() for s in buf[start:nl].rstrip(b"\r").split(b"\t")[9:]]
+                return sample_ids, nl + 1
+
+
+def _decode_general(sb: bytes, n_samples: int) -> np.ndarray | None:
+    """Decode leading diploid GT tokens, treating unsupported individual calls as missing.
+
+    Field boundaries are found in one C pass and valid calls are gathered by fancy indexing.
+    A malformed sample count rejects the record; bare missing, polyploid, multiallelic, or
+    otherwise unsupported *calls* become -1 without discarding valid peers. Haploid 0/1 calls
+    are pseudo-diploidized to 0/2 so sex-chromosome and mitochondrial variants remain usable.
+    """
+    if n_samples < 1:
+        return None
+    u = np.frombuffer(sb, dtype=np.uint8)
+    tabs = np.flatnonzero(u == _TAB)
+    if tabs.size != n_samples - 1:
+        return None
+    starts = np.empty(n_samples, dtype=np.intp)
+    ends = np.empty(n_samples, dtype=np.intp)
+    starts[0] = 0
+    if n_samples > 1:
+        starts[1:] = tabs + 1
+        ends[:-1] = tabs
+    ends[-1] = u.size
+    widths = ends - starts
+    dose = np.full(n_samples, -1, dtype=np.int8)
+
+    haploid = np.flatnonzero(widths >= 1)
+    if haploid.size:
+        pos = starts[haploid]
+        allele = u[pos]
+        term_pos = pos + 1
+        field_ends = ends[haploid]
+        good_term = term_pos == field_ends
+        has_suffix = term_pos < field_ends
+        good_term[has_suffix] = u[term_pos[has_suffix]] == _COLON
+        called = ((allele == _ZERO) | (allele == _ONE)) & good_term
+        dose[haploid[called]] = 2 * (allele[called] == _ONE).astype(np.int8)
+
+    diploid = np.flatnonzero(widths >= 3)
+    if diploid.size:
+        pos = starts[diploid]
+        a1 = u[pos]
+        sep = u[pos + 1]
+        a2 = u[pos + 2]
+        term_pos = pos + 3
+        field_ends = ends[diploid]
+        good_term = term_pos == field_ends
+        has_suffix = term_pos < field_ends
+        good_term[has_suffix] = u[term_pos[has_suffix]] == _COLON
+        called = (((a1 == _ZERO) | (a1 == _ONE))
+                  & ((a2 == _ZERO) | (a2 == _ONE))
+                  & ((sep == _SLASH) | (sep == _PIPE))
+                  & good_term)
+        targets = diploid[called]
+        # Pure-uint8 dosage: called alleles are already validated to '0'/'1', whose bytes sum to
+        # 96..98, so (a1+a2-2*'0') is exactly 0..2 with no int16 temporary. astype(int8) is a plain
+        # copy of those small values -- bit-identical to the old boolean sum.
+        dose[targets] = (a1[called] + a2[called] - 2 * _ZERO).astype(np.int8)
+    return dose
+
+
+def _decode_lines(lines, n_samples: int):
+    """Decode an iterable of raw VCF record lines into a (n_kept x n_samples) int8 dosage
+    matrix (missing = -1), or None. GT-only rows take a validated batched fast path; richer or
+    irregular GT rows use the general leading-token decoder. Invalid calls become missing while
+    valid calls in the same record remain usable.
+    """
+    if n_samples < 1:
+        return None
+    expected = 4 * n_samples - 1
+    fields = []
+    general = []
+    for line in lines:
+        if not line or line[:1] == b"#":
+            continue
+        if line[-1:] == b"\r":
+            line = line[:-1]
+        parts = line.split(b"\t", 9)
+        if len(parts) < 10 or not is_clean_biallelic_snv(parts[3], parts[4]):
+            continue
+        fmt = parts[8]
+        if fmt != b"GT" and not fmt.startswith(b"GT:"):
+            continue
+        sb = parts[9]
+        if fmt == b"GT" and len(sb) == expected:        # validate layouts together below
+            fields.append(sb)
+        else:
+            row = _decode_general(sb, n_samples)
+            if row is not None:
+                general.append(row)
+    mats = []
+    if fields:
+        arr = np.frombuffer(b"".join(fields), dtype=np.uint8).reshape(len(fields), expected)
+        tab_slots = arr[:, 3::4]
+        layout_ok = None if np.all(tab_slots == _TAB) else np.all(tab_slots == _TAB, axis=1)
+        if layout_ok is None or layout_ok.any():
+            good = arr if layout_ok is None else arr[layout_ok]
+            a1 = good[:, 0::4]
+            sep = good[:, 1::4]
+            a2 = good[:, 2::4]
+            # Pure-uint8 dosage: '0'/'1' bytes (48/49) sum to 96..98, so (a1+a2-2*'0') lands in
+            # 0..2 with no uint16 key/gather. Any other byte wraps mod 256, but the validity mask
+            # below overwrites every non-'0'/'1' allele (and bad separator) with -1 AFTER the add,
+            # so the int8 result is bit-identical to the _DIPLOID_LUT gather it replaces.
+            dose = (a1 + a2 - 2 * _ZERO).view(np.int8)
+            bad = (((a1 != _ZERO) & (a1 != _ONE)) | ((a2 != _ZERO) & (a2 != _ONE))
+                   | ((sep != _SLASH) & (sep != _PIPE)))
+            dose[bad] = -1
+            mats.append(dose)
+        if layout_ok is not None:
+            for index in np.flatnonzero(~layout_ok):
+                row = _decode_general(fields[int(index)], n_samples)
+                if row is not None:
+                    general.append(row)
+    if general:
+        mats.append(np.asarray(general, dtype=np.int8))
+    if not mats:
+        return None
+    return mats[0] if len(mats) == 1 else np.vstack(mats)
+
+
+def _read_core(fd: int, a: int, core_len: int, file_size: int, tail_chunk: int):
+    """Read the byte core [a, a+core_len), extended past the right edge to finish the record
+    that straddles it, and report whether ``a`` sits at a record boundary. Selecting records by
+    their *line-start* byte (below) with this tail extension makes inclusion probability
+    independent of record length -- long INFO lines are not under-sampled -- and correctly
+    handles a single record longer than the core (large sample counts)."""
+    data = os.pread(fd, core_len, a)
+    if not data:
+        return b"", True
+    at_start = (a == 0)
+    if a > 0:
+        at_start = os.pread(fd, 1, a - 1) == b"\n"
+    if not at_start and b"\n" not in data:
+        # The core lies wholly inside one pre-existing record. Its only line start is before the
+        # half-open interval, so extending to that record's distant newline can select nothing.
+        return b"", False
+    if data[-1:] != b"\n" and a + len(data) < file_size:
+        chunks = [data]
+        pos = a + len(data)
+        while pos < file_size:
+            e = os.pread(fd, min(tail_chunk, file_size - pos), pos)
+            if not e:
+                break
+            nl = e.find(b"\n")
+            if nl >= 0:
+                chunks.append(e[:nl + 1])
+                break
+            chunks.append(e)
+            pos += len(e)
+        data = b"".join(chunks)
+    return data, at_start
+
+
+def _parse_core(fd: int, a: int, core_len: int, file_size: int, n_samples: int,
+                tail_chunk: int):
+    """Decode exactly the records whose line-start byte lies in the core [a, a+core_len)."""
+    data, at_start = _read_core(fd, a, core_len, file_size, tail_chunk)
+    if not data:
+        return None
+    pos = 0
+    if not at_start:                                    # first line began in the previous core
+        nl = data.find(b"\n")
+        if nl < 0:
+            return None
+        pos = nl + 1
+    lines = []
+    dlen = len(data)
+    while pos < core_len and pos < dlen:
+        nl = data.find(b"\n", pos)
+        end = nl if nl >= 0 else dlen
+        lines.append(data[pos:end])
+        if nl < 0:
+            break
+        pos = nl + 1
+    return _decode_lines(lines, n_samples)
+
+
+def _rotate_cores(body_start: int, body_len: int, local_starts, core_len: int,
+                  rotation: int):
+    """Rotate a fixed nonoverlapping union around the body and split its one possible wrap."""
+    cores = []
+    for local_start in local_starts:
+        start = (int(local_start) + int(rotation)) % body_len
+        tail = min(core_len, body_len - start)
+        spans = [(body_start + start, tail)]
+        if tail < core_len:
+            spans.append((body_start, core_len - tail))
+        cores.append(tuple(spans))
+    return cores
+
+
+def _plan_cores(body_start: int, body_len: int, core_len: int, n_blocks: int, rng):
+    """Plan exactly unbiased nonoverlapping logical cores, or tile the complete body.
+
+    Partial coverage first jitters one interval independently inside every byte stratum, then
+    applies one uniform integer rotation on the circular body. The selected union has fixed size;
+    uniform rotation therefore gives every byte exactly equal marginal inclusion probability,
+    while independent jitter prevents periodic fixed-record layouts from aliasing one phase.
+    """
+    if body_len < 1 or core_len < 1 or n_blocks < 1:
+        raise ValueError("body length, core length, and block count must be positive")
+    core_len = min(int(core_len), body_len)
+    if n_blocks * core_len >= body_len:
+        cores = []
+        for start in range(0, body_len, core_len):
+            cores.append(((body_start + start, min(core_len, body_len - start)),))
+        return cores, True
+
+    edges = (np.arange(n_blocks + 1, dtype=np.int64) * body_len) // n_blocks
+    starts = np.empty(n_blocks, dtype=np.int64)
+    for j in range(n_blocks):
+        lo = int(edges[j])
+        slack = int(edges[j + 1] - edges[j] - core_len)
+        if slack < 0:
+            raise ValueError("sampling cores exceed their strata")
+        starts[j] = lo + int(rng.integers(0, slack + 1))
+    rotation = int(rng.integers(0, body_len))
+    return _rotate_cores(body_start, body_len, starts, core_len, rotation), False
+
+
+def _core_bytes(cores) -> int:
+    return sum(length for core in cores for _, length in core)
+
+
+def _parse_logical_core(fd, spans, file_size, n_samples, tail_chunk):
+    mats = []
+    for offset, length in spans:
+        mat = _parse_core(fd, int(offset), int(length), file_size, n_samples, tail_chunk)
+        if mat is not None:
+            mats.append(mat)
+    if not mats:
+        return None
+    return mats[0] if len(mats) == 1 else np.vstack(mats)
+
+
+def _worker_gram(fd, cores, n_samples, file_size, tail_chunk):
+    """Read the shard's cores, decode + Patterson-standardise, and accumulate the shard's n x n
+    Gram, streaming. Streaming the Gram (not holding the design) is what wins in the genotype-PCA
+    regime n << n_variants: the Gram is only n x n (a few MB) while the sampled design is
+    n_variants x n (hundreds of MB), so accumulating the Gram moves far less memory. No per-read
+    WILLNEED: before a blocking pread it cannot overlap (just a wasted syscall)."""
+    # Fortran-ordered so ssyrk in standardize_into_gram updates it in place with no BLAS copy; only
+    # the lower triangle is written (upper stays zero -> per-worker partials sum as one triangle).
+    gram = np.zeros((n_samples, n_samples), dtype=np.float32, order="F")
+    counter = {"kept": 0}
+    buf = []
+    buf_rows = 0
+    for spans in cores:
+        mat = _parse_logical_core(fd, spans, file_size, n_samples, tail_chunk)
+        if mat is None:
+            continue
+        buf.append(mat)
+        buf_rows += mat.shape[0]
+        if buf_rows >= 8000:
+            standardize_into_gram(np.vstack(buf), gram, counter)
+            buf.clear()
+            buf_rows = 0
+    if buf:
+        standardize_into_gram(np.vstack(buf), gram, counter)
+    return gram, counter["kept"]
+
+
+def _worker_collect(fd, cores, n_samples, file_size, tail_chunk):
+    """Read the shard's cores and return the stacked standardised design Z (for the matrix-free
+    engine, used only when n > n_variants and the n x n Gram would be the larger object)."""
+    blocks = []
+    for spans in cores:
+        mat = _parse_logical_core(fd, spans, file_size, n_samples, tail_chunk)
+        if mat is None:
+            continue
+        Z = standardize_block(mat)
+        if Z is not None:
+            blocks.append(Z)
+    if not blocks:
+        return np.zeros((0, n_samples), dtype=np.float32)
+    return np.vstack(blocks)
+
+
+def _worker_count(fd, cores, n_samples, file_size, tail_chunk):
+    kept = 0
+    for spans in cores:
+        mat = _parse_logical_core(fd, spans, file_size, n_samples, tail_chunk)
+        if mat is None:
+            continue
+        standardized = standardize_block(mat)
+        if standardized is not None:
+            kept += standardized.shape[0]
+    return kept
+
+
+def _count_cores(fd, cores, n_samples, file_size, tail_chunk, n_workers):
+    """Count informative rows per logical core without retaining a design or forming a Gram."""
+    workers = min(max(1, int(n_workers)), len(cores))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        counts = ex.map(
+            lambda core: _worker_count(fd, [core], n_samples, file_size, tail_chunk), cores,
+        )
+        return np.fromiter(counts, dtype=np.int64, count=len(cores))
+
+
+def _density_bounds(counts: np.ndarray, cores) -> tuple[float, float, float]:
+    """Four-standard-error bounds for informative-marker density across probe strata."""
+    counts = np.asarray(counts, dtype=np.float64)
+    widths = np.asarray([_core_bytes([core]) for core in cores], dtype=np.float64)
+    densities = counts / widths
+    mean = float(counts.sum() / widths.sum())
+    if densities.size < 2:
+        return mean, mean, mean
+    standard_error = float(densities.std(ddof=1) / np.sqrt(densities.size))
+    return max(0.0, mean - 4.0 * standard_error), mean, mean + 4.0 * standard_error
+
+
+# --------------------------------------------------------------------------- LEVER 5 pipeline
+#
+# The per-worker topology (K Python threads, BLAS pinned to 1, each owning its OWN n x n Gram)
+# can spend its time on the wrong resource: K copies of the ~n^2 Gram blow past the last-level
+# cache, and every added worker adds Gram-update memory traffic, not FLOPs. With BLAS widened to the
+# physical-core count at import (see the top of this file), the better topology on a genotype Gram
+# is a PIPELINE:
+#
+#   * lightweight PARSER threads do only I/O + decode + Patterson-standardise -- pread drops the
+#     GIL for the syscall and the strided numpy decode/standardise drop it for the vector work --
+#     and push standardised Z panels onto a BOUNDED queue;
+#   * one COMPUTE team owns ONE Fortran-order Gram and folds each Z panel in with a MULTI-threaded
+#     ssyrk (BLAS threads > 1), so the single hot Gram stays resident and the SYRK -- half the
+#     FLOPs of the GEMM and now cache-blocked across cores -- is the only heavy compute;
+#   * the bounded queue double-buffers automatically: panel j+1 is parsed while the team's SYRK
+#     crunches panel j, and backpressure caps live panels so memory stays flat.
+#
+# The statistic is bit-for-bit the per-worker one: same cores, same kept variants, same Z, and
+# sum_j Z_j^T Z_j is associative -- ssyrk just writes the lower triangle of the same accumulation.
+# Only the *topology* changes. The team's SYRK is multi-threaded because BLAS was widened to the
+# physical-core count at import (see the top of this file); that needs no runtime ctypes and works
+# on any backend (OpenBLAS / MKL / Accelerate). The per-worker Gram is kept only for the degenerate
+# single-worker path (its one SYRK simply uses the same wide BLAS).
+
+
+def _choose_topology(n_cores: int, n_samples: int):
+    """Map the core count + sample count onto (parser threads, panel rows) for the pipeline. The
+    parser lanes do I/O+decode+standardise (>=2, largely GIL/pread-bound so a handful saturate the
+    decode path) and feed the single multi-threaded-SYRK compute team. A panel is sized so Z
+    (~panel_rows x n, float32) plus the n x n Gram both stay resident in a tens-of-MB LLC and the
+    SYRK runs cache-blocked. Both are env-overridable for tuning."""
+    def _envi(name, default):
+        try:
+            v = int(os.environ.get(name, ""))
+        except ValueError:
+            return default
+        return v if v > 0 else default
+
+    n_parsers = max(1, _envi("FAST_PCA_PARSERS", max(2, n_cores - 1)))
+    panel_rows = max(64, _envi("FAST_PCA_PANEL_ROWS",
+                               int(np.clip(20_000_000 // (4 * max(n_samples, 1)), 512, 8192))))
+    return n_parsers, panel_rows
+
+
+def _pipeline_gram(fd, cores, n_samples, file_size, tail_chunk,
+                   n_parsers, panel_rows):
+    """Parser/compute-team pipeline (see the block comment above). Returns (lower-triangle Gram
+    float32, kept variants) -- the identical statistic to summing the per-worker Grams. The team's
+    ssyrk runs multi-threaded on the BLAS widened at import; no runtime thread switching."""
+    if len(cores) == 0:
+        return np.zeros((n_samples, n_samples), dtype=np.float32, order="F"), 0
+    n_parsers = max(1, min(n_parsers, len(cores)))
+    # Bounded queue => backpressure + double buffering. A couple of slots plus one per parser lets
+    # a parser stay one panel ahead of the SYRK without live panels piling up in memory.
+    q: queue.Queue = queue.Queue(maxsize=n_parsers + 2)
+    gram = np.zeros((n_samples, n_samples), dtype=np.float32, order="F")
+    kept = [0]
+
+    def _parser(shard):
+        buf, rows = [], 0
+        for spans in shard:
+            mat = _parse_logical_core(fd, spans, file_size, n_samples, tail_chunk)
+            if mat is None:
+                continue
+            buf.append(mat)
+            rows += mat.shape[0]
+            if rows >= panel_rows:                       # panel full -> standardise + hand off
+                Z = _standardize_kept(buf[0] if len(buf) == 1 else np.vstack(buf))
+                buf, rows = [], 0
+                if Z is not None:
+                    q.put(Z)
+        if buf:
+            Z = _standardize_kept(buf[0] if len(buf) == 1 else np.vstack(buf))
+            if Z is not None:
+                q.put(Z)
+
+    def _team():
+        kt = 0
+        while True:
+            Z = q.get()
+            try:
+                if Z is None:                            # sentinel: no more panels
+                    kept[0] = kt
+                    return
+                # C_lower += Z^T Z, in place on the Fortran-order team Gram (multi-threaded SYRK).
+                ssyrk(1.0, Z.T, beta=1.0, c=gram, trans=0, lower=1, overwrite_c=1)
+                kt += Z.shape[0]
+            finally:
+                q.task_done()
+
+    team = threading.Thread(target=_team, daemon=True)
+    team.start()
+    shards = [cores[i::n_parsers] for i in range(n_parsers)]
+    with ThreadPoolExecutor(max_workers=n_parsers) as ex:
+        list(ex.map(_parser, shards))                    # wait for all parsing to finish
+    q.put(None)                                          # sentinel for the single team
+    team.join()
+    return gram, int(kept[0])
+
+
+def fit(path: Path, k: int, n_blocks: int = DEFAULT_BLOCKS,
+        block_size: int = DEFAULT_BLOCK_SIZE, n_workers: int = 0,
+        seed: int = 12345, engine: str = "auto"):
+    # MARKER BUDGET (~4096 cores -> ~200k markers). Provenance: this default was originally tuned on
+    # real 1000G chr22 (also the scored observed arm) plus a same-family subtle-Fst corpus. That
+    # calibration OVERLAP is why the number is not, on its own, fair-ceiling evidence -- so fairness
+    # is not asserted from provenance, it is ENFORCED structurally on the frozen suite. The fast
+    # reference only sets the SPEED ceiling (its accuracy is never scored), and that ceiling is fair
+    # on a fold iff fast still resolves the structured subspace there:
+    #   * folds at or below the budget are read IN FULL -> the identical object to the full scan;
+    #   * folds fast subsamples are pinned by ``test_every_grade_fold_has_a_fair_fast_reference_speed
+    #     _ceiling`` to be strongly structured (fst >= 0.05) or low-rank (k <= 8), the regimes where
+    #     subsampling provably keeps every structured axis (tests/test_fast_pca_solver.py verifies
+    #     the recovery directly). A future weak-and-high-rank fold above the budget fails that test
+    #     rather than silently mis-anchoring the scale.
+    # So the overlap has no live consequence on the deployed suite, and the ceiling is a genuinely
+    # achievable time (a submission that samples adaptively to preserve accuracy reaches it). Under
+    # the calibration: ~200k markers (~208k kept on chr22, ~20% of the file) recover EVERY structured
+    # PC -- on chr22 PC1-8 clear |corr| >= 0.98 with the exact full-scan subspace -- while running
+    # ~26x faster (warm) than a full scan on a 2504-sample chromosome. The budget was raised from the
+    # old ~25k default once the accuracy metric became a geometric mean over the structured axes:
+    # dropping a real sub-continental axis now costs real reward, so the reference must resolve the
+    # whole structured subspace, not just PC1-5. Small files are read completely; large files use an
+    # independent density probe to hold this effective marker budget even when FORMAT/INFO fields are
+    # wide or many records are ineligible.
+    k = int(k)
+    n_blocks = int(n_blocks)
+    block_size = int(block_size)
+    seed = int(seed)
+    if k < 1 or n_blocks < 1 or block_size < 1 or seed < 0:
+        raise ValueError("k, block count, and block size must be positive; seed must be nonnegative")
+    engine_request = str(engine)
+    if engine_request not in {"auto", "gram", "matrixfree"}:
+        raise ValueError(f"unknown PCA engine: {engine_request}")
+    if str(path).endswith((".gz", ".bgz")):
+        raise ValueError("fast_pca reads plain (unindexed) VCF; gz has no random access")
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        try:
+            os.posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM)
+        except (OSError, AttributeError):
+            pass
+        sample_ids, body_start = _read_header(fd)
+        n = len(sample_ids)
+        if n < 2:
+            raise ValueError("PCA requires at least two samples")
+        if k >= n:
+            raise ValueError("k must satisfy 1 <= k < number of samples")
+        file_size = os.fstat(fd).st_size
+        body_len = file_size - body_start
+        if body_len <= 0:
+            raise ValueError("empty VCF body")
+
+        nominal_record = 4 * n + 64
+        # One outlier record must not control coverage or engine choice. Core amortization and
+        # boundary reads use the layout-derived nominal width; _read_core already extends across
+        # genuinely long records in bounded chunks.
+        minimum_core = int(min(max(1, 8 * nominal_record), body_len))
+        tail_chunk = int(max(4096, min(4 * nominal_record, 4 << 20)))
+        auto_workers = n_workers <= 0
+        if n_workers <= 0:
+            n_workers = min(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                            else (os.cpu_count() or 4), 16)
+            # Choosing the tool for the file we actually have. Parallel decode only pays once there
+            # is enough body to amortize standing the machinery up; under that, a lone lane reading
+            # straight through is strictly faster (see PIPELINE_MIN_BODY_BYTES). An explicitly
+            # requested worker count is always honoured -- this is the automatic choice only.
+            if body_len < PIPELINE_MIN_BODY_BYTES:
+                n_workers = 1
+        n_workers = max(1, min(int(n_workers), n_blocks))
+
+        hard_min = max(8192, 512 * k)
+        nominal_target = max(1, (
+            DEFAULT_TARGET_VARIANTS * n_blocks * block_size
+        ) // (DEFAULT_BLOCKS * DEFAULT_BLOCK_SIZE))
+        target_kept = max(hard_min, nominal_target)
+        required_kept = max(hard_min, int(np.ceil(0.90 * target_kept)))
+
+        # The density probe exists to answer exactly one question: what FRACTION of the body do we
+        # have to read to reach the marker budget? Scattering 256 small strata over the file is the
+        # right way to answer it when the answer is genuinely in doubt.
+        #
+        # But the answer is often not in doubt. A VCF record for n samples cannot be shorter than
+        # its own genotype columns, so the body holds at most body_len / (2n + 16) records -- and
+        # when even that ceiling is below the budget, every eligible marker is already needed. The
+        # fraction is 1. There is nothing to decide, and probing anyway is pure loss: those strata
+        # were sized by count rather than by I/O, which on a 20 MB file meant 256 cores of ~4 KB
+        # whose per-core parse cost dominated the whole fit and made this sampler LOSE to a plain
+        # full scan -- the one thing it exists to beat. So bound the record count first, for free,
+        # and when it settles the question, take a single contiguous slice instead: enough to size
+        # the Gram-vs-matrix-free choice, and nothing spent on a fraction we have already deduced.
+        probe_sequence, final_sequence = np.random.SeedSequence(seed).spawn(2)
+        shortest_record = 2 * n + 16              # "\t0" per sample + the shortest fixed columns
+        must_read_every_record = body_len // max(1, shortest_record) <= target_kept
+        if must_read_every_record:
+            probe_budget = int(min(body_len, max(minimum_core, 1 << 18)))
+            probe_blocks = 1
+        else:
+            probe_budget = min(body_len, min(8 << 20, max(1 << 20, body_len // 128)))
+            # Keep strata I/O-sized. A stratum smaller than a handful of records buys no variance
+            # reduction and costs a parse call.
+            probe_blocks = int(min(256, max(1, probe_budget // max(1, minimum_core))))
+        probe_core = max(1, probe_budget // probe_blocks)
+        probe_cores, probe_full = _plan_cores(
+            body_start, body_len, probe_core, probe_blocks,
+            np.random.default_rng(probe_sequence),
+        )
+        probe_bytes = _core_bytes(probe_cores)
+        probe_counts = _count_cores(
+            fd, probe_cores, n, file_size, tail_chunk, n_workers,
+        )
+        probe_kept = int(probe_counts.sum())
+        mean_density = probe_kept / probe_bytes if probe_kept else 0.0
+        if probe_full:
+            density_floor = density_ceiling = mean_density
+        else:
+            density_floor, mean_density, density_ceiling = _density_bounds(
+                probe_counts, probe_cores,
+            )
+        if must_read_every_record:
+            # Deduced, not measured: the ceiling on record count already put the fraction at 1.
+            planned_bytes = body_len
+            density_floor = density_ceiling = mean_density
+        elif density_floor > 0:
+            planned_bytes = int(np.ceil(target_kept / density_floor))
+            planned_bytes = min(body_len, planned_bytes)
+        else:
+            planned_bytes = body_len
+
+        # Preserve broad genomic coverage without paying thousands of syscalls for small inputs.
+        # At least 256 independently jittered strata (the same resolution as the excluded pilot)
+        # cover roughly a dozen regions per chromosome; larger byte budgets keep adding strata so
+        # contiguous reads remain I/O-sized. Experiments with explicit LD blocks show that forcing
+        # one core per handful of markers adds syscall cost without improving the recovered space.
+        coalesced_blocks = max(1, int(np.ceil(planned_bytes / block_size)))
+        if planned_bytes < body_len:
+            final_blocks = min(n_blocks, max(MIN_SAMPLING_STRATA, coalesced_blocks))
+        else:
+            # Every record is selected: this is a sequential STREAM, not a scattered sample, and the
+            # two want opposite core sizes. Spatial strata exist to spread a partial read across the
+            # genome; when the read is total they spread nothing and simply multiply parse calls.
+            # Tiling a 20 MB body into block-sized cores meant ~80 separate decode calls whose
+            # per-call overhead -- not the I/O -- is what made this sampler lose to a plain full
+            # scan. Size the cores for throughput instead: one long contiguous run per worker.
+            streaming_core = int(max(block_size, min(
+                SEQUENTIAL_CORE_BYTES, max(1, planned_bytes // max(1, n_workers)),
+            )))
+            final_blocks = min(n_blocks, max(1, int(np.ceil(planned_bytes / streaming_core))))
+        core_len = max(minimum_core, int(np.ceil(planned_bytes / final_blocks)))
+        cores, full_coverage = _plan_cores(
+            body_start, body_len, core_len, final_blocks, np.random.default_rng(final_sequence),
+        )
+        # Read-ahead was switched off up front (FADV_RANDOM) because a *sampled* read hops between
+        # distant offsets, where every prefetched neighbour is a page we paid for and throw away.
+        # But the budget can turn out to cover the entire body -- a small file, or one with few
+        # eligible records -- and then we are about to stream it end to end. Keeping read-ahead
+        # suppressed in that case is exactly the wrong hint: each fault becomes its own I/O instead
+        # of riding a prefetch. Measured, that made the sampled path ~2.3x SLOWER than a plain full
+        # scan on a small VCF -- the sampler losing to the thing it is supposed to beat, purely on a
+        # kernel hint. Advise for the access pattern we actually have, not the one we planned for.
+        if full_coverage:
+            try:
+                os.posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)
+            except (OSError, AttributeError):
+                pass
+        selected_bytes = _core_bytes(cores)
+        total_selected_bytes = probe_bytes + selected_bytes
+        workers = min(n_workers, len(cores))
+        # Bytes-read gate (see PIPELINE_MIN_READ_BYTES): the body-size test up front cannot see how
+        # much of a large body the budget actually reads. When the planned read is small -- a heavy
+        # subsample of a big file, or a small file -- the pipeline's fixed standing-up cost (worse
+        # under the sandbox, where it is uncorrected) cannot be repaid, so collapse to a single lane
+        # regardless of body size. Only the automatic choice is overridden; an explicit worker count
+        # is still honoured for tests and callers that know their machine.
+        if auto_workers and total_selected_bytes < PIPELINE_MIN_READ_BYTES:
+            workers = 1
+
+        # Account for actual implementation peaks: Gram mode holds one n*n matrix per worker plus
+        # the global matrix, while collection peaks at worker parts plus the stacked M*n design.
+        if probe_full and full_coverage:
+            mean_estimate = lower_estimate = upper_estimate = probe_kept
+        else:
+            mean_estimate = int(round(mean_density * selected_bytes))
+            lower_estimate = int(np.floor(density_floor * selected_bytes))
+            upper_estimate = int(np.ceil(density_ceiling * selected_bytes))
+        gram_units = max(workers + 1, 5)
+        crossover = gram_units * n / 2.0
+        gram_peak_bytes = gram_units * n * n * np.dtype(np.float32).itemsize
+        exact_count = None
+        if engine_request == "auto" and full_coverage and probe_kept == 0:
+            exact_count = int(_count_cores(
+                fd, cores, n, file_size, tail_chunk, n_workers,
+            ).sum())
+        elif engine_request == "auto" and full_coverage and not probe_full \
+                and gram_peak_bytes > (512 << 20):
+            exact_count = int(_count_cores(
+                fd, cores, n, file_size, tail_chunk, n_workers,
+            ).sum())
+        elif engine_request == "auto" and lower_estimate <= crossover <= upper_estimate:
+            exact_count = int(_count_cores(
+                fd, cores, n, file_size, tail_chunk, n_workers,
+            ).sum())
+        if exact_count is not None:
+            total_selected_bytes += selected_bytes
+            engine_variants = estimated_variants = exact_count
+        else:
+            engine_variants = max(0, lower_estimate)
+            estimated_variants = max(0, mean_estimate)
+
+        use_gram = engine_request == "gram" or (
+            engine_request == "auto" and gram_units * n <= 2 * engine_variants
+        )
+        shards = [cores[i::workers] for i in range(workers)]
+        if use_gram:
+            # LEVER 5: the parser/compute-team pipeline (multi-threaded SYRK on one hot Gram, BLAS
+            # widened at import) is the fast path whenever there is more than one worker lane. The
+            # single-worker path keeps the per-worker Gram (its one SYRK uses the same wide BLAS) --
+            # it is what the deterministic unit tests exercise and it avoids spinning up a pipeline
+            # for a lone core.
+            if workers > 1:
+                n_cores = (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                           else (os.cpu_count() or 4))
+                n_parsers, panel_rows = _choose_topology(n_cores, n)
+                gram, kept = _pipeline_gram(
+                    fd, cores, n, file_size, tail_chunk, n_parsers, panel_rows)
+            else:
+                gram = np.zeros((n, n), dtype=np.float32, order="F")
+                kept = 0
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    for worker_gram, worker_kept in ex.map(lambda shard: _worker_gram(
+                            fd, shard, n, file_size, tail_chunk), shards):
+                        gram += worker_gram
+                        kept += worker_kept
+                del worker_gram
+            final_engine = "gram"
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                parts = list(ex.map(lambda shard: _worker_collect(
+                    fd, shard, n, file_size, tail_chunk), shards))
+            Z = np.vstack(parts)
+            del parts
+            kept = Z.shape[0]
+            final_engine = "matrixfree"
+
+        if kept == 0:
+            raise ValueError("no informative variants decoded from the sampled cores")
+        if kept < k:
+            raise ValueError(f"only {kept} informative variants available for {k} PCs")
+        if use_gram:
+            scores, _ = gram_to_scores(gram, kept, k)
+        else:
+            scores, _ = matrixfree_scores(Z, k, seed=seed)
+
+        meta = {"kept_variants": kept, "target_variants": target_kept,
+                "required_variants": required_kept,
+                "probe_variants": probe_kept, "n_blocks": len(cores),
+                "block_size": core_len, "selected_bytes": total_selected_bytes,
+                "final_selected_bytes": selected_bytes,
+                "file_size": file_size, "n_workers": workers, "engine": final_engine,
+                "estimated_variants": estimated_variants,
+                "engine_floor_variants": engine_variants,
+                "probe_density_floor": density_floor,
+                "probe_density_ceiling": density_ceiling,
+                "marker_target_met": full_coverage or kept >= required_kept,
+                "count_pass": exact_count is not None,
+                "full_coverage": full_coverage}
+        return sample_ids, scores, kept, meta
+    finally:
+        os.close(fd)
+
+
+def write_scores(sample_ids, scores, out_path: Path):
+    k = scores.shape[1]
+    with open(out_path, "w") as fh:
+        fh.write("sample_id\t" + "\t".join(f"PC{i+1}" for i in range(k)) + "\n")
+        for sid, row in zip(sample_ids, scores):
+            fh.write(sid + "\t" + "\t".join(f"{v:.6f}" for v in row) + "\n")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("vcf")
+    ap.add_argument("k", type=int)
+    ap.add_argument("out")
+    ap.add_argument("--blocks", type=int, default=DEFAULT_BLOCKS)
+    ap.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    ap.add_argument("--workers", type=int, default=0)
+    a = ap.parse_args(argv)
+    t0 = time.time()
+    sample_ids, scores, kept, meta = fit(Path(a.vcf), a.k, a.blocks, a.block_size, a.workers)
+    write_scores(sample_ids, scores, Path(a.out))
+    dt = time.time() - t0
+    if not meta["marker_target_met"]:
+        print(f"warning: retained {kept} informative variants; accuracy target is "
+              f"{meta['required_variants']}", file=sys.stderr)
+    frac = 100 * meta["selected_bytes"] / meta["file_size"]
+    print(f"fast: {len(sample_ids)} samples x {kept} variants -> {scores.shape[1]} PC in "
+          f"{dt:.2f}s (logical core work ~{frac:.1f}% of file, "
+          f"{meta['n_workers']} workers)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

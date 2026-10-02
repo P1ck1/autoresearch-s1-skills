@@ -1,0 +1,6 @@
+interface:
+  display_name: "AutoResearch 2 · 双镜像与模型连接"
+  short_description: "S1第2阶段：双镜像与模型连接，保留真实证据并核验阶段交接与完成条件"
+  default_prompt: "使用 $autoresearch-s1-package 执行当前 S1 任务的第2阶段，先读取阶段交接并落实真实验证。"
+policy:
+  allow_implicit_invocation: true

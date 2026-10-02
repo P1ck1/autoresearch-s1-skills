@@ -1,0 +1,41 @@
+{
+  "purpose": "original source identities; paths are provenance, not runtime dependencies",
+  "files": {
+    "C:\\Users\\22602\\.codex\\skills\\autoresearch-s1-deliver\\SKILL.md": "15d3270601d5f927e0642cf033d8dba2a99f9896f12f529c6a8537b7be0676de",
+    "C:\\Users\\22602\\Documents\\ChatGPT\\autore\\AutoResearch_第二代_第四部分_最终复验与交付.md": "235f89c752e76d3ec5e791a069f636f7dfae7d15b9a6440e5c3a6bae56d830cf"
+  },
+  "bundled_source_hashes": {
+    "references/supplied-qa/autoresearch-baseline-quality/SKILL.md": "e1ad68530be94c2cfe59ee146a7dd37c614eae537ff85cbda3e7147c0c150d76",
+    "references/supplied-qa/autoresearch-task-qa/SKILL.md": "ec63dd69aaca9bfc591448d9df400e010f7acfe4cd95b87d3e39e30a29ee2aec",
+    "references/supplied-qa/autoresearch-baseline-quality/agents/openai.yaml": "79d7424f5e8da52b31b833d3d62313b7f5b0dc7e4c91fd9dd3a5852770fe286b",
+    "references/supplied-qa/autoresearch-baseline-quality/references/baseline-review-method.md": "15f996157d18b17209d0640bec24e2c39711fbac682ee7eaac830c7a7a8a568c",
+    "references/supplied-qa/autoresearch-task-qa/agents/openai.yaml": "17c41d7c878f9ddb61590d2aec3ad24fdf2ca2dc1447429ca7993a5e6a841a82",
+    "references/supplied-qa/autoresearch-task-qa/references/docker-path-contract.md": "e0ed173b923778d6f0ea2eb825a1d339ed59845289b15588e77d3192241a3e00",
+    "references/supplied-qa/autoresearch-task-qa/references/exposure-manifest.md": "abe68d027bade9af9803d6e6a0950995af176f4b74fc4c9501e6c17dc26093be",
+    "references/supplied-qa/autoresearch-task-qa/references/harbor-harness.md": "20de0afb44536f34c4b055807dbeef6cae5419c76ce22a729e7e0c7b597388eb",
+    "references/supplied-qa/autoresearch-task-qa/references/implementation-policy.md": "543caf482eb9fdf6c010e68c6a248df874564a0479c8bb352d2943e566730e73",
+    "references/supplied-qa/autoresearch-task-qa/references/implementation-report.md": "6cef7c1fe3d5d02d2e294bc3f2926b13c84de146af5768a0236e10ffe2313e7d",
+    "references/supplied-qa/autoresearch-task-qa/references/precheck-policy.md": "4c84074aa9214f5a6070f038ea1b084d30cd947abac3f4510c1b149432d5550c",
+    "references/supplied-qa/autoresearch-task-qa/references/qa-spec.md": "7a26bce4dde9283b2f3a289659b93f8a7120096059bebc4306d7514609e5475a",
+    "references/supplied-qa/autoresearch-task-qa/references/report-schema.md": "10ff4bbcb2ddf77fd2f5a8b985ff72b7b49b87a11da682f49a6ee687998853fd",
+    "references/supplied-qa/autoresearch-task-qa/references/research-quality.md": "3304e93def3129922fe7544bca7fd6a778aa6df1270aa9259ee1ee6ef71d0724",
+    "references/supplied-qa/autoresearch-task-qa/references/source-alignment.md": "29ad8762a65b1e4b2286a9b88f2fe1696698af1d94a2c9234f8707329ea05eee",
+    "references/supplied-qa/autoresearch-task-qa/references/submission-format.md": "f18eec464f5e4ab4c380b01f72b8a8f9272666623ac3070c5fb4da76658f4b8f",
+    "references/supplied-qa/autoresearch-task-qa/scripts/audit_collection.py": "ef92ae3d2d7a9fffdb85765899b2509b1336c56841c34bc4cb8df9bc273594e8",
+    "references/supplied-qa/autoresearch-task-qa/scripts/audit_task.py": "645750955d35a2a409b17d286458ca8bfee32cf0f5e696125d0f66a577dc1db8",
+    "references/supplied-qa/autoresearch-task-qa/scripts/content_gates.py": "baab33a3c4b51b30b93d3136398295673e814b5de67de06a6ce98999c664d29c",
+    "references/supplied-qa/autoresearch-task-qa/scripts/docker_paths.py": "be570eb632b22ba3527cca7af18dd50da35a170c383f10884b3ab532e861a7fa",
+    "references/supplied-qa/autoresearch-task-qa/scripts/harbor_review.py": "92093a91a5aceb1e86121496d17550dab46621c2dd61ebf97f2ebbd5ce6851a4",
+    "references/supplied-qa/autoresearch-task-qa/scripts/implementation_review.py": "29818d175f8fd813b25cadaa1ff50584967fadb1eac4c44d2d33c7c685472c1e",
+    "references/supplied-qa/autoresearch-task-qa/scripts/submission_format.py": "bcd594e3641accf4d39125f1a0dd724a1e1ce6d70e028805505d15d0d80f50c7",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_audit_collection.py": "10e4b826aa9654d03cf662e95419da435242a996953197186aa49fad8ca84b87",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_audit_task.py": "ff29243a232b450d0991f369dbfec0c787eefc17fb267cc80a68db02d722b43d",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_content_gates.py": "95ca6a2a34fc97a1d64a2a63f534d1ec2ea429edcc9f9b2acd0787279b8ae52b",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_docker_paths.py": "d09ebf502a2e45d9241432af3a598761853e2cc1e39da453a1b705ef8c4d3f6d",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_harbor_review.py": "951d19d6af697b4401636bf46805ddbd06e84ed67dbe358d1893fe06efd1c358",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_implementation_review.py": "473d31aae8b687060c9c790657cf12873bed2f2b8d08e7bd60b045d09a7af91e",
+    "references/supplied-qa/autoresearch-task-qa/scripts/test_submission_format.py": "4ce1ecbc73b18835ce63a5adaac9cbf089afea2a5f6301b6c92879be93df8c63",
+    "references/source-documents/deliverables.md": "3cd31e4114394a73d160c2cc276eba589631a5f9c4fc82064d90555d97332278",
+    "references/source-documents/tutorial-v2.pdf": "b23c0e2f80d69a2d725f49c541eeda5a76e619e8c65bfa716c767606cd757e54"
+  }
+}

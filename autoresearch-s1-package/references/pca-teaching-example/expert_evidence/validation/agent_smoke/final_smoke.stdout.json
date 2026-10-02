@@ -1,0 +1,77 @@
+{
+  "protocol": "pca-public-dev.v1",
+  "split": "public_dev",
+  "status": "ok",
+  "score": 0.05065513417874165,
+  "score_name": "mean_log2_dev_speedup",
+  "direction": "maximize",
+  "quality_gate": {
+    "min_subspace_similarity": 0.98,
+    "all_cases_passed": true
+  },
+  "repeats": 3,
+  "cases": [
+    {
+      "case": "structured",
+      "public_seed": 2026092901,
+      "fixture_sha256": "b294f95de31c624814583a79e685a74b0bacef722a35d9485f5eb39d2371e629",
+      "k": 3,
+      "min_subspace_similarity": 0.9999999999999994,
+      "quality_gate_passed": true,
+      "baseline_seconds": [
+        0.06605833300272934,
+        0.05010416600271128,
+        0.07233320802333765
+      ],
+      "candidate_seconds": [
+        0.051471499988110736,
+        0.06604029098525643,
+        0.06057254198822193
+      ],
+      "median_speedup": 1.0905656397179782,
+      "log2_speedup": 0.12507660651757047
+    },
+    {
+      "case": "mixed_calls",
+      "public_seed": 2026092902,
+      "fixture_sha256": "3c7d6409bcc0eb5296dade6fab81883e82aa779d6893c54f139faa5361bc8e0e",
+      "k": 4,
+      "min_subspace_similarity": 1.0,
+      "quality_gate_passed": true,
+      "baseline_seconds": [
+        0.08549808300449513,
+        0.071431999997003,
+        0.07317083299858496
+      ],
+      "candidate_seconds": [
+        0.06869466698844917,
+        0.07126875000540167,
+        0.07272162497974932
+      ],
+      "median_speedup": 1.0266888782676715,
+      "log2_speedup": 0.037999062101606196
+    },
+    {
+      "case": "sample_heavy",
+      "public_seed": 2026092903,
+      "fixture_sha256": "193cc71782acfb2d3f088af5ec82524ffc240b80c225d9c869113c56cf721c28",
+      "k": 3,
+      "min_subspace_similarity": 1.0,
+      "quality_gate_passed": true,
+      "baseline_seconds": [
+        0.05204354101442732,
+        0.05451562500093132,
+        0.052711374999489635
+      ],
+      "candidate_seconds": [
+        0.05560208298265934,
+        0.04941683399374597,
+        0.053118874988285825
+      ],
+      "median_speedup": 0.9923285274982564,
+      "log2_speedup": -0.01111026608295171
+    }
+  ],
+  "scope": "Public timing/accuracy proxy only; not Hidden reward, security acceptance, or G03 evidence.",
+  "timing_note": "Baseline then candidate; process startup and warm-cache/order effects are included. Small-fixture timings fluctuate."
+}

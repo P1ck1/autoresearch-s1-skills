@@ -1,0 +1,6 @@
+interface:
+  display_name: "AutoResearch 4 · 最终复验与六项交付"
+  short_description: "S1第4阶段：最终复验与六项交付，保留真实证据并核验阶段交接与完成条件"
+  default_prompt: "使用 $autoresearch-s1-deliver 执行当前 S1 任务的第4阶段，先读取阶段交接并落实真实验证。"
+policy:
+  allow_implicit_invocation: true

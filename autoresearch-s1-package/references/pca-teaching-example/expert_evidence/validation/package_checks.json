@@ -1,0 +1,32 @@
+{
+  "checks": {
+    "three_delivery_roots": true,
+    "eight_instruction_sections": true,
+    "task_id_consistent": true,
+    "separate_and_artifacts": true,
+    "resources_retained": true,
+    "all_json_parse": true,
+    "python_syntax": true,
+    "shell_syntax": true,
+    "docker_copy_sources_in_context": true,
+    "no_symlinks_or_caches": true,
+    "private_grader_and_data_bytes_preserved": true,
+    "expert_fast_reference_preserved": true,
+    "no_private_material_in_agent_context": true,
+    "starter_is_not_fast_reference": true,
+    "runtime_paths_no_old_submission": true,
+    "public_assets_hashes": true,
+    "no_fabricated_trajectories": true,
+    "formal_evidence_not_run": true,
+    "no_model_directory": true,
+    "best_method_not_fabricated": true,
+    "native_score_difference_documented": true
+  },
+  "passed": true,
+  "python_files_parsed": 30,
+  "unchanged_private_files": 23,
+  "docker_build": "NOT_RUN_DAEMON_UNAVAILABLE",
+  "harbor_integration": "NOT_RUN",
+  "hidden_grade": "NOT_RUN",
+  "long_agent_trajectories": "NOT_RUN"
+}

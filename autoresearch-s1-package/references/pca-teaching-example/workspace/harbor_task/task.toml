@@ -1,0 +1,55 @@
+schema_version = "1.3"
+
+# Only the solver-owned submission crosses into the separate verifier. Harbor manages verifier
+# logs itself; importing agent-controlled /logs would let a failed verifier inherit a forged reward.
+artifacts = ["/workspace/solution"]
+
+[task]
+name = "teaching/population-genetics-pca"
+description = "Implement a fast, from-scratch population-genetics PCA over raw multi-sample VCFs in pure Python, without genomics or PCA libraries."
+authors = [{ name = "Emulated" }]
+keywords = ["pca", "population-genetics", "vcf", "from-scratch", "systems"]
+
+[metadata]
+difficulty = "hard"
+category = "ml-modeling"
+task_id = "pca-teaching-format-example-20260929"
+ext_id = "pca-teaching-format-example-20260929-v1"
+display_title = "Population-genetics PCA — teaching format example"
+display_description = "Build a fast Patterson HWE-normalised PCA over raw, unindexed multi-sample VCFs in pure Python with a fixed CLI."
+tags = ["pca", "population-genetics", "vcf", "from-scratch", "hwe", "systems"]
+language = "python"
+languages = ["python"]
+
+[agent]
+timeout_sec = 86400
+
+# The verifier covers multiple large VCFs under a global wall-clock deadline.
+[verifier]
+timeout_sec = 10800
+environment_mode = "separate"
+user = "root"
+
+# The sealed verifier image is built from tests/Dockerfile. It privately contains the grader and
+# checksum-pinned observed chromosome arm; none of those artifacts exist in the agent container.
+[verifier.environment]
+network_mode = "no-network"
+build_timeout_sec = 3600
+cpus = 8
+memory_mb = 16384
+storage_mb = 32768
+gpus = 0
+mcp_servers = []
+
+# The task is fully offline (instruction.md: "no web, no installing packages"): all deps are baked
+# into the image at build time, so the running container needs no network. Closing egress removes
+# a runtime escape (fetching a forbidden package / native artefact and loading it). Build-time
+# network for `pip install` is governed separately by the image build, not this runtime policy.
+[environment]
+network_mode = "no-network"
+build_timeout_sec = 1800
+cpus = 8
+memory_mb = 16384
+storage_mb = 32768
+gpus = 0
+mcp_servers = []

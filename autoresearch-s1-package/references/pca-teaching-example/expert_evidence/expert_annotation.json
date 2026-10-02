@@ -1,0 +1,28 @@
+{
+  "task_id": "pca-teaching-format-example-20260929",
+  "task_type": null,
+  "research_direction": "群体遗传学 PCA / CPU 算法与系统优化",
+  "optimization_surface": "保持全部合格位点定义不变，优化VCF解析、数值计算、内存和I/O实现；不是只改参数。",
+  "score_contract": {
+    "metric": "native_reward",
+    "direction": "maximize",
+    "split": "hidden",
+    "protocol": "source-native-pca-retained-not-unified-normalization",
+    "baseline": {
+      "raw_value": null,
+      "normalized_score": null
+    },
+    "reference": {
+      "raw_value": null,
+      "normalized_score": null
+    },
+    "upper_bound": {
+      "raw_value": 1.0,
+      "source": "metric_ceiling"
+    }
+  },
+  "isolation": {
+    "reference_visible_to_agent": false,
+    "hidden_assets_visible_to_agent": false
+  }
+}

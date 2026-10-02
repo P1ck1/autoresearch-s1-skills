@@ -1,0 +1,32 @@
+{
+  "mode": "production",
+  "task_id": "",
+  "task_version": "",
+  "max_wall_seconds": null,
+  "slice_timeout_seconds": null,
+  "max_attempts": null,
+  "isolation_report": {
+    "path": "",
+    "sha256": ""
+  },
+  "model_probe_report": {
+    "path": "",
+    "sha256": ""
+  },
+  "tracks": {
+    "codex": {
+      "model": "GPT-5.6 Sol",
+      "effort": "Max",
+      "adapter_argv": [],
+      "candidate_root": "",
+      "adapter_files": []
+    },
+    "seed": {
+      "model": "Seed 2.1 Turbo",
+      "effort": "High",
+      "adapter_argv": [],
+      "candidate_root": "",
+      "adapter_files": []
+    }
+  }
+}

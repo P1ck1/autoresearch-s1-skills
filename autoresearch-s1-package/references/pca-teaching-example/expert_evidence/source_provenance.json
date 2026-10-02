@@ -1,0 +1,11 @@
+{
+  "source_archive": "population-genetics-pca.tar.gz",
+  "source_archive_sha256": "cac6b610d9588202cb53dbdf955345993d8b738aecb3a93c9a97a1cb6f8ff257",
+  "source_task": "population-genetics-pca/environment/source/env/tasks/from_scratch_pca",
+  "adaptation_date": "2026-09-29",
+  "scope": "教学结构与运行流程适配，保留原生Hidden评分；不是正式验收通过记录",
+  "reference_source": "population-genetics-pca/environment/source/env/reference/fast_pca.py",
+  "reference_sha256": "cc634b2063b5464b34b5f1ef080aa8828fe6aec1fa8f40e8e8b26999774205a5",
+  "source_evidence_status": "源码存在；README历史分数未作为本轮实跑证据迁移",
+  "private_materials": "原固定评测派生材料仅保留在私有tests侧；本包不应整体暴露给Agent"
+}

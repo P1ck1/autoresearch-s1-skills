@@ -1,0 +1,43 @@
+{
+  "schema_version": "pca-public-dev.v1",
+  "visibility": "public",
+  "purpose": "Small workflow/accuracy fixtures; not Hidden data or research evidence.",
+  "generator": "public_eval/generate_dev.py",
+  "rng": "numpy.random.default_rng/PCG64",
+  "generation_numpy_version": "2.0.2",
+  "cases": [
+    {
+      "id": "structured",
+      "path": "structured.vcf",
+      "public_seed": 2026092901,
+      "samples": 64,
+      "generated_markers": 768,
+      "extra_ineligible_or_monomorphic_records": 4,
+      "k": 3,
+      "bytes": 217403,
+      "sha256": "b294f95de31c624814583a79e685a74b0bacef722a35d9485f5eb39d2371e629"
+    },
+    {
+      "id": "mixed_calls",
+      "path": "mixed_calls.vcf",
+      "public_seed": 2026092902,
+      "samples": 80,
+      "generated_markers": 960,
+      "extra_ineligible_or_monomorphic_records": 4,
+      "k": 4,
+      "bytes": 486653,
+      "sha256": "3c7d6409bcc0eb5296dade6fab81883e82aa779d6893c54f139faa5361bc8e0e"
+    },
+    {
+      "id": "sample_heavy",
+      "path": "sample_heavy.vcf",
+      "public_seed": 2026092903,
+      "samples": 96,
+      "generated_markers": 40,
+      "extra_ineligible_or_monomorphic_records": 4,
+      "k": 3,
+      "bytes": 20050,
+      "sha256": "193cc71782acfb2d3f088af5ec82524ffc240b80c225d9c869113c56cf721c28"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "direction": "maximize",
+  "evaluation_mode": "stochastic",
+  "formal_seeds": [],
+  "upper_bound": null,
+  "upper_bound_basis": "",
+  "same_protocol": false,
+  "paired_runs": [],
+  "input_item_schema": {
+    "seed": null,
+    "baseline": null,
+    "reference": null,
+    "quality_valid": false,
+    "baseline_evidence": {
+      "path": "",
+      "sha256": "",
+      "metric_path": []
+    },
+    "reference_evidence": {
+      "path": "",
+      "sha256": "",
+      "metric_path": []
+    }
+  }
+}
